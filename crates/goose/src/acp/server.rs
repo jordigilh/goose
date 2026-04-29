@@ -1045,9 +1045,8 @@ impl GooseAcpAgent {
                                 .into_iter()
                                 .find(|job| job.provider_id == provider_id);
                             if let Some(refresh_job) = refresh_job {
-                                let mut refresh_guard = self
-                                    .provider_inventory
-                                    .refresh_guard(&refresh_job.identity);
+                                let mut refresh_guard =
+                                    self.provider_inventory.refresh_guard(&refresh_job.identity);
                                 let fetch_result: Result<Vec<String>> =
                                     match ensure_refresh_identity_current(
                                         &provider_id,
