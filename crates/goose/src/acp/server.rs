@@ -1018,8 +1018,10 @@ impl GooseAcpAgent {
         let mut prebuilt_provider = None;
         if should_refresh_inventory_for_session_init(&inventory) {
             let config = Config::global();
-            let ext_state =
-                EnabledExtensionsState::extensions_or_default(Some(&goose_session.extension_data), config);
+            let ext_state = EnabledExtensionsState::extensions_or_default(
+                Some(&goose_session.extension_data),
+                config,
+            );
             match self
                 .create_provider(provider_name, model_config.clone(), ext_state)
                 .await
@@ -1115,7 +1117,7 @@ impl GooseAcpAgent {
                                 }
                             }
                         }
-                        Ok(_) => {},
+                        Ok(_) => {}
                         Err(error) => warn!(
                             provider = %provider_id,
                             error = %error,
@@ -1130,13 +1132,12 @@ impl GooseAcpAgent {
                     {
                         inventory = refreshed_inventory;
                     }
-                    },
-                    Err(error) => warn!(
-                        provider = %provider_name,
-                        error = %error,
-                        "failed to initialize provider during synchronous inventory refresh"
-                    ),
                 }
+                Err(error) => warn!(
+                    provider = %provider_name,
+                    error = %error,
+                    "failed to initialize provider during synchronous inventory refresh"
+                ),
             }
         }
 
@@ -1256,7 +1257,7 @@ impl GooseAcpAgent {
 
             // ── Phase 2: load extensions (slow, may take seconds) ────────
             let phase2: Result<(), String> = async {
-                let mut extensions = get_enabled_extensions_with_config(&config);
+                let mut extensions = get_enabled_extensions_with_config(config);
                 extensions.extend(builtins.iter().map(|b| builtin_to_extension_config(b)));
 
                 let acp_developer = if (client_fs_capabilities.read_text_file
@@ -2573,7 +2574,7 @@ impl GooseAcpAgent {
             .internal_err_ctx("Failed to get provider")?;
         let provider_name = current_provider.get_name().to_string();
         let extensions =
-            EnabledExtensionsState::for_session(&self.session_manager, &internal_id, &config).await;
+            EnabledExtensionsState::for_session(&self.session_manager, &internal_id, config).await;
         let model_config = crate::model::ModelConfig::new(model_id)
             .invalid_params_err_ctx("Invalid model config")?
             .with_canonical_limits(&provider_name);
@@ -2737,7 +2738,7 @@ impl GooseAcpAgent {
             .with_request_params(request_params);
 
         let extensions =
-            EnabledExtensionsState::for_session(&self.session_manager, &internal_id, &config).await;
+            EnabledExtensionsState::for_session(&self.session_manager, &internal_id, config).await;
         let new_provider = self
             .create_provider(&resolved_provider_name, model_config, extensions)
             .await
