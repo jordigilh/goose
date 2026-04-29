@@ -43,6 +43,7 @@ export function ChatInput({
   selectedProvider = "goose",
   onProviderChange,
   currentModelId = null,
+  currentModelProviderId = null,
   currentModel,
   availableModels = [],
   modelsLoading = false,
@@ -451,6 +452,7 @@ export function ChatInput({
                 selectedProvider={selectedProvider}
                 onProviderChange={(id) => onProviderChange?.(id)}
                 currentModelId={currentModelId}
+                currentModelProviderId={currentModelProviderId}
                 currentModel={resolvedCurrentModel}
                 availableModels={availableModels}
                 modelsLoading={modelsLoading}
