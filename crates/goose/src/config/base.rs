@@ -52,6 +52,10 @@ pub enum ConfigError {
     KeyringError(String),
     #[error("Failed to lock config file: {0}")]
     LockError(String),
+    #[error(
+        "Global config already initialized with writable path {existing}; cannot use requested writable path {requested}"
+    )]
+    GlobalConfigPathMismatch { existing: String, requested: String },
     #[error("Secret stored using file-based fallback")]
     FallbackToFileStorage,
 }
@@ -163,43 +167,7 @@ fn bundled_defaults_path() -> Option<PathBuf> {
 
 impl Default for Config {
     fn default() -> Self {
-        let config_dir = Paths::config_dir();
-        let user_config_path = config_dir.join(CONFIG_YAML_NAME);
-
-        let mut config_paths = vec![system_config_path()];
-        if let Some(defaults) = bundled_defaults_path() {
-            config_paths.insert(0, defaults);
-        }
-        config_paths.push(user_config_path.clone());
-
-        let no_secrets_config = Self {
-            config_paths: config_paths.clone(),
-            secrets: SecretStorage::File {
-                path: Default::default(),
-            },
-            guard: Mutex::new(()),
-            secrets_cache: Arc::new(Mutex::new(None)),
-        };
-
-        let secrets = if env::var("GOOSE_DISABLE_KEYRING").is_ok()
-            || no_secrets_config
-                .get_param::<serde_yaml::Value>("GOOSE_DISABLE_KEYRING")
-                .is_ok_and(|v| keyring_disabled_value(&v))
-        {
-            SecretStorage::File {
-                path: config_dir.join("secrets.yaml"),
-            }
-        } else {
-            SecretStorage::Keyring {
-                service: KEYRING_SERVICE.to_string(),
-            }
-        };
-        Self {
-            config_paths,
-            secrets,
-            guard: Mutex::new(()),
-            secrets_cache: Arc::new(Mutex::new(None)),
-        }
+        Self::with_config_dir(Paths::config_dir())
     }
 }
 
@@ -352,35 +320,75 @@ impl Config {
         GLOBAL_CONFIG.get_or_init(Config::default)
     }
 
+    fn config_paths_for_dir(config_dir: &Path) -> Vec<PathBuf> {
+        let mut config_paths = vec![system_config_path()];
+        if let Some(defaults) = bundled_defaults_path() {
+            config_paths.insert(0, defaults);
+        }
+        config_paths.push(config_dir.join(CONFIG_YAML_NAME));
+        config_paths
+    }
+
+    fn with_config_dir(config_dir: PathBuf) -> Self {
+        let config_paths = Self::config_paths_for_dir(&config_dir);
+
+        let no_secrets_config = Self {
+            config_paths: config_paths.clone(),
+            secrets: SecretStorage::File {
+                path: Default::default(),
+            },
+            guard: Mutex::new(()),
+            secrets_cache: Arc::new(Mutex::new(None)),
+        };
+
+        let secrets = if env::var("GOOSE_DISABLE_KEYRING").is_ok()
+            || no_secrets_config
+                .get_param::<serde_yaml::Value>("GOOSE_DISABLE_KEYRING")
+                .is_ok_and(|v| keyring_disabled_value(&v))
+        {
+            SecretStorage::File {
+                path: config_dir.join("secrets.yaml"),
+            }
+        } else {
+            SecretStorage::Keyring {
+                service: KEYRING_SERVICE.to_string(),
+            }
+        };
+
+        Self {
+            config_paths,
+            secrets,
+            guard: Mutex::new(()),
+            secrets_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn ensure_writable_path(&self, requested: &Path) -> Result<(), ConfigError> {
+        if self.write_path() == requested {
+            return Ok(());
+        }
+
+        Err(ConfigError::GlobalConfigPathMismatch {
+            existing: self.write_path().display().to_string(),
+            requested: requested.display().to_string(),
+        })
+    }
+
     /// Initialize the global configuration with a custom config directory.
     ///
-    /// If the global instance has already been initialized (e.g. by a prior call
-    /// to `global()` or `init_global()`), this returns the existing instance and
-    /// the provided path is ignored. This is safe because Goose runs one ACP
-    /// server per process.
-    pub fn init_global(config_dir: PathBuf) -> &'static Config {
-        GLOBAL_CONFIG.get_or_init(|| {
-            let config_path = config_dir.join(CONFIG_YAML_NAME);
+    /// If the global instance has already been initialized, this validates that
+    /// the requested config directory resolves to the same writable config path.
+    pub fn init_global(config_dir: PathBuf) -> Result<&'static Config, ConfigError> {
+        let requested = config_dir.join(CONFIG_YAML_NAME);
 
-            let secrets = if env::var("GOOSE_DISABLE_KEYRING").is_ok()
-                || keyring_disabled_in_config(&config_path)
-            {
-                SecretStorage::File {
-                    path: config_dir.join("secrets.yaml"),
-                }
-            } else {
-                SecretStorage::Keyring {
-                    service: KEYRING_SERVICE.to_string(),
-                }
-            };
+        if let Some(config) = GLOBAL_CONFIG.get() {
+            config.ensure_writable_path(&requested)?;
+            return Ok(config);
+        }
 
-            Config {
-                config_path,
-                secrets,
-                guard: Mutex::new(()),
-                secrets_cache: Arc::new(Mutex::new(None)),
-            }
-        })
+        let config = GLOBAL_CONFIG.get_or_init(|| Self::with_config_dir(config_dir));
+        config.ensure_writable_path(&requested)?;
+        Ok(config)
     }
 
     /// Create a new configuration instance with custom paths

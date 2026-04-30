@@ -23,8 +23,8 @@ use sacp::schema::{
 };
 use std::collections::VecDeque;
 use std::future::Future;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use wiremock::matchers::{method, path};
@@ -130,6 +130,41 @@ pub type DuplexTransport = sacp::ByteStreams<
     tokio_util::compat::Compat<tokio::io::DuplexStream>,
 >;
 
+static ACP_TEST_CONFIG_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+static ACP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn acp_test_config_dir() -> PathBuf {
+    if std::env::var_os("GOOSE_PATH_ROOT").is_some() {
+        return Paths::config_dir();
+    }
+
+    ACP_TEST_CONFIG_DIR
+        .get_or_init(|| tempfile::tempdir().unwrap())
+        .path()
+        .to_path_buf()
+}
+
+fn prepare_acp_config_dir(data_root: &Path, config_dir: &Path, current_model: &str) {
+    fs::create_dir_all(config_dir).unwrap();
+
+    let source_config = data_root.join(goose::config::base::CONFIG_YAML_NAME);
+    let target_config = config_dir.join(goose::config::base::CONFIG_YAML_NAME);
+
+    if source_config.exists() {
+        if source_config != target_config {
+            fs::copy(source_config, target_config).unwrap();
+        }
+    } else {
+        fs::write(
+            target_config,
+            format!("GOOSE_MODEL: {current_model}\nGOOSE_PROVIDER: openai\n"),
+        )
+        .unwrap();
+    }
+
+    let _ = fs::remove_file(config_dir.join("permission.yaml"));
+}
+
 /// Wires up duplex streams, spawns `serve` for the given agent, and returns
 /// a ready-to-use sacp transport plus the server handle.
 #[allow(dead_code)]
@@ -161,14 +196,8 @@ pub async fn spawn_acp_server_in_process(
     fs::create_dir_all(data_root).unwrap();
     // TODO: Paths::in_state_dir is global, ignoring per-test data_root
     fs::create_dir_all(Paths::in_state_dir("logs")).unwrap();
-    let config_path = data_root.join(goose::config::base::CONFIG_YAML_NAME);
-    if !config_path.exists() {
-        fs::write(
-            &config_path,
-            format!("GOOSE_MODEL: {current_model}\nGOOSE_PROVIDER: openai\n"),
-        )
-        .unwrap();
-    }
+    let config_dir = acp_test_config_dir();
+    prepare_acp_config_dir(data_root, &config_dir, current_model);
     let provider_factory = provider_factory.unwrap_or_else(|| {
         let base_url = openai_base_url.to_string();
         Arc::new(move |_provider_name, model_config, _extensions| {
@@ -188,7 +217,7 @@ pub async fn spawn_acp_server_in_process(
         provider_factory,
         builtins.to_vec(),
         data_root.to_path_buf(),
-        data_root.to_path_buf(),
+        config_dir,
         goose_mode,
         true,
         GoosePlatform::GooseCli,
@@ -526,6 +555,7 @@ pub trait Connection: Sized {
         value: &str,
     ) -> anyhow::Result<()>;
     fn data_root(&self) -> std::path::PathBuf;
+    fn permission_config_path(&self) -> std::path::PathBuf;
     fn reset_openai(&self);
     fn reset_permissions(&self);
 }
@@ -555,6 +585,8 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     register_builtin_extensions(goose_mcp::BUILTIN_EXTENSIONS.clone());
+
+    let _guard = ACP_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 
     let handle = std::thread::Builder::new()
         .name("acp-test".to_string())

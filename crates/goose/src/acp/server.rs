@@ -951,6 +951,8 @@ impl GooseAcpAgent {
         disable_session_naming: bool,
         goose_platform: GoosePlatform,
     ) -> Result<Self> {
+        Config::init_global(config_dir.clone())?;
+
         let session_manager = Arc::new(SessionManager::new(data_dir));
 
         // Eagerly initialize the SQLite pool so it's ready when providers/sessions need it.
