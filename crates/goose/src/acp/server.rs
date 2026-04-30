@@ -3,12 +3,12 @@ use crate::acp::fs::AcpTools;
 use crate::acp::tools::AcpAwareToolMeta;
 use crate::acp::{PermissionDecision, ACP_CURRENT_MODEL};
 use crate::agents::extension::{Envs, PLATFORM_EXTENSIONS};
-use crate::agents::extension_manager::TRUSTED_TOOL_UPDATE_META_KEY;
+use crate::agents::extension_manager::{is_hidden_extension, TRUSTED_TOOL_UPDATE_META_KEY};
 use crate::agents::mcp_client::{GooseMcpHostInfo, McpClientTrait};
 use crate::agents::platform_extensions::developer::DeveloperClient;
 use crate::agents::{Agent, AgentConfig, ExtensionConfig, GoosePlatform, SessionConfig};
 use crate::config::base::CONFIG_YAML_NAME;
-use crate::config::extensions::get_enabled_extensions_with_config;
+use crate::config::extensions::{get_enabled_extensions_with_config, name_to_key};
 use crate::config::paths::Paths;
 use crate::config::permission::PermissionManager;
 use crate::config::{Config, GooseMode};
@@ -526,6 +526,27 @@ fn format_tool_name(tool_name: &str) -> String {
     } else {
         tool_name.replace('_', " ")
     }
+}
+
+fn tool_call_meta(tool_name: &str) -> Meta {
+    let mut tool_call = serde_json::Map::new();
+    tool_call.insert(
+        "toolName".to_string(),
+        serde_json::Value::String(tool_name.to_string()),
+    );
+    if let Some((extension, _)) = tool_name.split_once("__") {
+        tool_call.insert(
+            "extensionName".to_string(),
+            serde_json::Value::String(extension.to_string()),
+        );
+    }
+
+    let mut goose = serde_json::Map::new();
+    goose.insert("toolCall".to_string(), serde_json::Value::Object(tool_call));
+
+    let mut meta = Meta::new();
+    meta.insert("goose".to_string(), serde_json::Value::Object(goose));
+    meta
 }
 
 /// Build a short fallback title from the tool name and arguments by extracting
@@ -1563,7 +1584,8 @@ impl GooseAcpAgent {
             ToolCallId::new(tool_request.id.clone()),
             fallback_title.clone(),
         )
-        .status(ToolCallStatus::Pending);
+        .status(ToolCallStatus::Pending)
+        .meta(tool_call_meta(&tool_name));
         if let Some(args) = args_value.clone() {
             initial_tool_call = initial_tool_call.raw_input(args);
         }
@@ -2288,7 +2310,8 @@ impl GooseAcpAgent {
                                     ToolCallId::new(tool_request.id.clone()),
                                     format_tool_name(&tool_name),
                                 )
-                                .status(ToolCallStatus::Pending),
+                                .status(ToolCallStatus::Pending)
+                                .meta(tool_call_meta(&tool_name)),
                             ),
                         ))?;
                     }
@@ -3045,7 +3068,10 @@ impl GooseAcpAgent {
 
     #[custom_method(GetExtensionsRequest)]
     async fn on_get_extensions(&self) -> Result<GetExtensionsResponse, sacp::Error> {
-        let extensions = crate::config::extensions::get_all_extensions();
+        let extensions = crate::config::extensions::get_all_extensions()
+            .into_iter()
+            .filter(|ext| !is_hidden_extension(&ext.config.name()))
+            .collect::<Vec<_>>();
         let warnings = crate::config::extensions::get_warnings();
         let extensions_json = extensions
             .into_iter()
@@ -3137,10 +3163,9 @@ impl GooseAcpAgent {
             .await
             .internal_err()?;
 
-        let extensions = EnabledExtensionsState::extensions_or_default(
-            Some(&session.extension_data),
-            crate::config::Config::global(),
-        );
+        let config = self.config()?;
+        let extensions =
+            EnabledExtensionsState::extensions_or_default(Some(&session.extension_data), &config);
 
         let extensions_json = extensions
             .into_iter()
@@ -3149,6 +3174,101 @@ impl GooseAcpAgent {
             .internal_err()?;
 
         Ok(GetSessionExtensionsResponse {
+            extensions: extensions_json,
+        })
+    }
+
+    #[custom_method(GetSessionExtensionStatusRequest)]
+    async fn on_get_session_extension_status(
+        &self,
+        req: GetSessionExtensionStatusRequest,
+    ) -> Result<GetSessionExtensionStatusResponse, sacp::Error> {
+        let internal_id = self.internal_session_id(&req.session_id).await?;
+        let session = self
+            .session_manager
+            .get_session(&internal_id, false)
+            .await
+            .internal_err()?;
+        let config = self.config()?;
+        let expected_extensions =
+            EnabledExtensionsState::extensions_or_default(Some(&session.extension_data), &config);
+
+        let agent = self.get_session_agent(&req.session_id, None).await?;
+        let connected_extensions = agent.get_extension_configs().await;
+        let connected_keys: std::collections::HashSet<String> = connected_extensions
+            .iter()
+            .map(|ext| name_to_key(&ext.name()))
+            .collect();
+        let mut seen_keys = std::collections::HashSet::new();
+        let mut extensions = Vec::new();
+        for extension in expected_extensions {
+            let key = name_to_key(&extension.name());
+            seen_keys.insert(key);
+            extensions.push(extension);
+        }
+        for extension in connected_extensions {
+            let key = name_to_key(&extension.name());
+            if seen_keys.insert(key) {
+                extensions.push(extension);
+            }
+        }
+
+        let mut extensions_json = Vec::new();
+        for extension in extensions {
+            if is_hidden_extension(&extension.name()) {
+                continue;
+            }
+
+            let config_key = extension.key();
+            let connected = connected_keys.contains(&name_to_key(&extension.name()));
+            let tools = if connected {
+                agent
+                    .list_tools(&internal_id, Some(extension.name().to_string()))
+                    .await
+                    .into_iter()
+                    .map(|tool| tool.name.to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
+            let mut value = serde_json::to_value(&extension).internal_err()?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "config_key".to_string(),
+                    serde_json::Value::String(config_key),
+                );
+                obj.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(if connected {
+                        "connected".to_string()
+                    } else {
+                        "failed".to_string()
+                    }),
+                );
+                obj.insert(
+                    "tools".to_string(),
+                    serde_json::Value::Array(
+                        tools
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect::<Vec<_>>(),
+                    ),
+                );
+                if !connected {
+                    obj.insert(
+                        "error".to_string(),
+                        serde_json::Value::String(
+                            "Goose could not connect this extension when the chat started."
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+            extensions_json.push(value);
+        }
+
+        Ok(GetSessionExtensionStatusResponse {
             extensions: extensions_json,
         })
     }
